@@ -252,7 +252,9 @@ download()
 
 extract_package()
 {
-	cpio -idm < $PACKAGE.gustpkg && rm -f $PACKAGE.gustpkg
+	echo -n "Extracting $PACKAGE... "
+	cpio -idm < $PACKAGE.tazpkg && rm -f $PACKAGE.tazpkg
+	echo -n "Extracting the pseudo fs... "
 	zcat fs.cpio.gz | cpio -idm && rm fs.cpio.gz
 }
 
