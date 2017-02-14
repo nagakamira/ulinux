@@ -1,0 +1,1143 @@
+#!/bin/sh
+# 
+# Gustpkg - Simple packages manager for μLinux.
+#
+
+# === Configuration ============================================================
+
+VERSION=1.0
+
+CATEGORIES="
+base-system
+x-window
+utilities
+network
+graphics
+multimedia
+office
+development
+system-tools
+security
+games
+misc
+meta
+non-free"
+
+COMMAND=$1
+if [ -f "$2" ]; then
+	PACKAGE=$(basename ${2%.gustpkg} 2>/dev/null)
+else
+	PACKAGE=${2%.gustpkg}
+fi
+PACKAGE_FILE=$2
+TARGET_DIR=$3
+TOP_DIR=`pwd`
+TMP_DIR=/tmp/gustpkg-$$-$RANDOM
+
+LOCALSTATE=/var/lib/gustpkg
+INSTALLED=$LOCALSTATE/installed
+CACHE_DIR=/var/cache/gustpkg
+MIRROR=$LOCALSTATE/mirror
+BLOCKED=$LOCALSTATE/blocked-packages.list
+LOG=/var/log/gustpkg.log
+
+WARNING="\\033[1;31mWARNING\\033[0;39m"
+
+if test $(id -u) = 0 ; then
+	if [ ! -d "$CACHE_DIR" ]; then
+		mkdir -p $CACHE_DIR
+	fi
+	if [ ! -d "$INSTALLED" ]; then
+		mkdir -p $INSTALLED
+	fi
+	if [ ! -f "$LOCALSTATE/mirror" ]; then
+		echo "$DEFAULT_MIRROR" > $LOCALSTATE/mirror
+	fi
+fi
+
+# === Library ==================================================================
+
+usage()
+{
+  echo -e "μLinux packages manager - Version: $VERSION
+
+\033[1mUsage: \033[0m `basename $0` [command] [package] [dir]
+\033[1mCommands: \033[0m
+
+	usage				Print this usage.
+	list				List all installed packages.
+	add				Install a local (*.gustpkg) package (--forced to force).
+	remove				Remove the specified package and all installed files.
+	block|unblock			Block an installed package version or unblock it for upgrade.
+	get-list			Download and install a list of packages from the mirror.
+	update				Recharge your packges.list from the mirror.
+	upgrade				Upgrade all installed and listed packages on the mirror.
+	download-only			Download a package into the current directory.
+	install				Download and install a package from the mirror.
+"
+}
+
+status()
+{
+	local CHECK=$?
+	echo -en "\\033[70G[ "
+	if [ $CHECK = 0 ]; then
+		echo -en "\\033[1;33mOK"
+	else
+		echo -en "\\033[1;31mFailed"
+	fi
+	echo -e "\\033[0;39m ]"
+	return $CHECK
+}
+
+check_root()
+{
+	if test $(id -u) != 0 ; then
+		echo -e "You must be root to run `basename $0` with this option."
+		exit 0
+	fi
+}
+
+check_for_package_on_cmdline()
+{
+	if [ -z "$PACKAGE" ]; then
+		echo -e "Please specify a package name on the command line."
+		exit 0
+	fi
+}
+
+check_for_package_file()
+{
+	if [ ! -f "$PACKAGE_FILE" ]; then
+		echo -e "
+Unable to find : $PACKAGE_FILE\n"
+		exit 0
+	fi
+}
+
+check_for_receipt()
+{
+	if [ ! -f "$1$INSTALLED/$PACKAGE/receipt" ]; then
+		echo -e "Unable to find the receipt: $1$INSTALLED/$PACKAGE/receipt"
+		exit 0
+	fi
+}
+
+package_fullname_in_dir()
+{
+	[ -f $2$1/receipt ] || return
+	EXTRAVERSION=""
+	. $2$1/receipt
+	echo $PACKAGE-$VERSION$EXTRAVERSION
+}
+
+get_installed_package_pathname()
+{
+	for i in $2$INSTALLED/${1%%-*}*; do
+		[ -d $i ] || continue
+		if [ "$1" = "$(package_fullname_in_dir $i $2)" ]; then
+			echo $i
+			return
+		fi
+	done
+}
+
+check_for_installed_package()
+{
+	if [ -n "$(get_installed_package_pathname $PACKAGE $1)" ]; then
+		echo -e "
+$PACKAGE is already installed. You can use the --forced option to force
+installation or remove it and reinstall.\n"
+		exit 0
+	fi
+}
+
+check_for_packages_list()
+{
+	if [ ! -f "$LOCALSTATE/packages.list" ]; then
+		if test $(id -u) = 0 ; then
+			update
+		else
+			echo -e "
+Unable to find the list: $LOCALSTATE/packages.list\n
+You should probably run 'gustpkg update' as root to get the latest list of 
+packages available on the mirror."
+			exit 0
+		fi
+	fi
+}
+
+get_package_filename()
+{
+	local pkg
+	pkg=$(grep -A 1 -sh "^$1$" $LOCALSTATE/packages.txt \
+		$LOCALSTATE/undigest/*/packages.txt | tail -1)
+	pkg=$(echo $pkg)
+	[ -n "$pkg" ] && pkg=$(grep -sh "^$1-$pkg" \
+		$LOCALSTATE/packages.list \
+		$LOCALSTATE/undigest/*/packages.list | head -1)
+	[ -n "$pkg" ] || pkg=$(grep -sh "^$1-[0-9]" \
+		$LOCALSTATE/packages.list \
+		$LOCALSTATE/undigest/*/packages.list | head -1)
+	[ -n "$pkg" ] || pkg=$(grep -sh "^$1-.[\.0-9]" \
+		$LOCALSTATE/packages.list \
+		$LOCALSTATE/undigest/*/packages.list | head -1)
+	if [ -z "$pkg" ]; then
+		# Check for vitual package
+		local equiv
+		equiv=$(equivalent_pkg $1 virtual)
+		if [ "$equiv" != "$1" ]; then
+			PACKAGE=$equiv
+			get_package_filename $PACKAGE
+			return
+		fi
+	fi
+	echo $pkg
+}
+
+check_for_package_in_list()
+{
+	local filename
+	local check_only
+	check_only="$1"
+	filename=$(get_package_filename $PACKAGE)
+	if [ -n "$filename" ]; then
+		PACKAGE=$filename
+	else
+		echo -e "Unable to find: $PACKAGE in the mirrored packages list."
+		[ -n "$check_only" ] && return 1
+		exit 0
+	fi
+}
+
+log()
+{
+	local extra
+	[ "$1" = "Installed" ] && \
+	extra=" - $(grep $PACKAGE-$VERSION $LOCALSTATE/installed.md5 | awk '{ print $1 }')"
+	[ -e $LOG ] || touch $LOG
+	DATE=`date +'%F %T'`
+	[ -w $LOG ] && 
+	echo "$DATE - $1 - $PACKAGE ($VERSION$EXTRAVERSION)$extra" >> $LOG
+}
+
+download_from()
+{
+	local i
+	local mirrors
+	mirrors="$1"
+	shift
+	for i in $mirrors; do
+		case "$i" in
+		http://*|ftp://*) wget -c $i$@ && break;;
+		*) cp $i/$1 . && break;;
+		esac
+	done
+}
+
+download()
+{
+	local i
+	case "$1" in
+	*.gustpkg)
+		for i in $LOCALSTATE $LOCALSTATE/undigest/* ; do
+			grep "^${1%.gustpkg}$" $i/packages.list || continue
+			download_from "$(cat $i/mirror)" "$@" && return
+		done
+	esac
+	for i in $(cat $MIRROR $LOCALSTATE/undigest/*/mirror 2> /dev/null); do
+		download_from "$i" "$@" && break
+	done
+}
+
+extract_package()
+{
+	cpio -idm < $PACKAGE.gustpkg && rm -f $PACKAGE.gustpkg
+	zcat fs.cpio.gz | cpio -idm && rm fs.cpio.gz
+}
+
+install_package()
+{
+	ROOT=$1
+	if [ -n "$ROOT" ]; then
+		 ROOT=$(cd $ROOT; pwd)
+	fi
+	(
+		mkdir -p $TMP_DIR
+		( cd $TMP_DIR ; cpio -i receipt > /dev/null) < $PACKAGE_FILE
+		. $TMP_DIR/receipt
+		if grep -q ^pre_depends $TMP_DIR/receipt; then
+			pre_depends $ROOT
+		fi
+		cp $ROOT$INSTALLED/$PACKAGE/modifiers $TMP_DIR 2> /dev/null
+		rm -rf $ROOT$INSTALLED/$PACKAGE 2> /dev/null
+		mkdir -p $ROOT$INSTALLED/$PACKAGE
+		cp $TMP_DIR/modifiers $ROOT$INSTALLED/$PACKAGE 2> /dev/null
+		rm -rf $TMP_DIR 2> /dev/null
+		sed -i "/ $(basename $PACKAGE_FILE)$/d" \
+			$ROOT$LOCALSTATE/installed.md5 2> /dev/null
+		cd $(dirname $PACKAGE_FILE)
+		md5sum $(basename $PACKAGE_FILE) >> $ROOT$LOCALSTATE/installed.md5
+	)
+	check_for_deps $ROOT
+	if [ ! "$MISSING_PACKAGE" = "" ]; then
+		install_deps $ROOT
+	fi
+	mkdir -p $TMP_DIR
+	[ -n "$INSTALL_LIST" ] && echo "$PACKAGE_FILE" >> $INSTALL_LIST-processed
+    echo "================================================================================" >&3
+    echo "Installing the $PACKAGE package..."
+    echo "================================================================================" >&3
+	echo -n "Copying $PACKAGE... "
+	cp $PACKAGE_FILE $TMP_DIR
+	status
+	cd $TMP_DIR
+	extract_package
+	SELF_INSTALL=0
+	EXTRAVERSION=""
+	CONFIG_FILES=""
+	# Include temporary receipt to get the right variables.
+	. $PWD/receipt
+	if [ $SELF_INSTALL -ne 0 -a -n "$ROOT" ]; then
+		echo -n "Checking post install dependencies... "
+		[ -f $INSTALLED/$PACKAGE/receipt ]
+		if ! status; then
+			echo "Please run 'gustpkg install $PACKAGE_FILE' in / and retry."
+			cd .. && rm -rf $TMP_DIR
+			exit 1
+		fi
+	fi
+	for i in $(grep -v '\[' files.list); do
+		[ -e "$ROOT$i" ] || continue
+		[ -d "$ROOT$i" ] && continue
+		for j in $(grep -l "^$i$" $ROOT$INSTALLED/*/files.list); do
+			local dir
+			dir=$(dirname $j)
+			[ "$j" = "$ROOT$INSTALLED/$PACKAGE/files.list" ] && continue
+			if grep -qs ^$(basename $dir)$ \
+				  $ROOT$INSTALLED/$PACKAGE/modifiers; then
+				rm .$i 2> /dev/null
+				continue
+			fi
+			grep -qs ^$PACKAGE$ $dir/modifiers && continue
+			if [ -s "$dir/volatile.cpio.gz" ]; then
+				zcat $dir/volatile.cpio.gz | \
+					cpio -t 2> /dev/null | \
+					grep -q "^${i#/}$" && continue
+			fi
+			echo "$PACKAGE" >> $dir/modifiers
+		done
+	done
+	cp receipt files.list $ROOT$INSTALLED/$PACKAGE
+	if [ -f "description.txt" ]; then
+		cp description.txt $ROOT$INSTALLED/$PACKAGE
+	fi
+	if [ -f "md5sum" ]; then
+		cp md5sum $ROOT$INSTALLED/$PACKAGE
+	fi
+	if grep -q ^pre_install $ROOT$INSTALLED/$PACKAGE/receipt; then
+		pre_install $ROOT
+	fi
+	if [ -n "$CONFIG_FILES" ]; then
+		echo -n "Save configuration files for $PACKAGE... "
+		for i in $CONFIG_FILES; do
+			( cd fs ; find ${i#/} -type f )
+		done | ( cd fs ; cpio -o -H newc | gzip -9 ) > \
+			$ROOT$INSTALLED/$PACKAGE/volatile.cpio.gz
+		for i in $CONFIG_FILES; do
+			( cd fs ; find ${i#/} -type f )
+		done | while read i; do
+			[ -e $ROOT/$i ] || continue
+			cp -a $ROOT/$i fs/$i
+		done
+		status
+	fi
+	echo -n "Installing $PACKAGE... "
+	cp -a fs/* $ROOT/
+	status
+	echo -n "Removing all tmp files... "
+	cd .. && rm -rf $TMP_DIR
+	status
+	if grep -q ^post_install $ROOT$INSTALLED/$PACKAGE/receipt; then
+		post_install $ROOT
+	fi
+	cd $TOP_DIR
+	[ -n "$ROOT" ] || log Installed
+
+}
+
+check_for_deps_loop()
+{
+	local list
+	local pkg
+	local deps
+	pkg=$1
+	shift
+	[ -n "$1" ] || return
+	list=""
+	for i in $@; do
+		case " $ALL_DEPS" in
+		*\ $i\ *);;
+		*) list="$list $i";;
+		esac
+	done
+	ALL_DEPS="$ALL_DEPS$list "
+	for i in $list; do
+		[ -f $i/receipt ] || continue
+		deps="$(DEPENDS=""; . $i/receipt; echo $DEPENDS)"
+		case " $deps " in
+		*\ $pkg\ *) echo -e "$MSG  $i"; MSG="";;
+		*) check_for_deps_loop $pkg $deps;;
+		esac
+	done
+}
+
+check_for_deps()
+{
+	local saved;
+	saved=$PACKAGE
+	mkdir -p $TMP_DIR
+	( cd $TMP_DIR ; cpio -i receipt > /dev/null ) < $PACKAGE_FILE
+	. $TMP_DIR/receipt
+	PACKAGE=$saved
+	rm -rf $TMP_DIR
+	for pkgorg in $DEPENDS
+	do
+		i=$(equivalent_pkg $pkgorg $1)
+		if [ ! -d "$1$INSTALLED/$i" ]; then
+			MISSING_PACKAGE=$i
+			deps=$(($deps+1))
+		elif [ ! -f "$1$INSTALLED/$i/receipt" ]; then
+			echo -e "$WARNING Dependency loop between $PACKAGE and $i."
+		fi
+	done
+	if [ ! "$MISSING_PACKAGE" = "" ]; then
+    	echo "================================================================================" >&3
+    	echo "Tracking dependencies for $PACKAGE..."
+    	echo "================================================================================" >&3
+		for pkgorg in $DEPENDS
+		do
+			i=$(equivalent_pkg $pkgorg $1)
+			if [ ! -d "$1$INSTALLED/$i" ]; then
+				MISSING_PACKAGE=$i
+				echo "Missing : $MISSING_PACKAGE"
+			fi
+		done
+		echo "$deps missing package(s) to install."
+	fi
+}
+
+install_deps()
+{
+	local root
+	root=""
+	[ -n "$1" ] && root="--root=$1"
+	echo ""
+	echo -n "Install all missing dependencies (Y/n)?"; read anser
+	echo ""
+	if [ "$anser" = "y" ]; then
+		for pkgorg in $DEPENDS
+		do
+			pkg=$(equivalent_pkg $pkgorg $1)
+			if [ ! -d "$1$INSTALLED/$pkg" ]; then
+				local list
+				list="$INSTALL_LIST"
+				[ -n "$list" ] || list="$TOP_DIR/packages.list"
+				found=0
+				if [ -f "$list" ]; then
+					echo "Checking if $pkg exists in local list... "
+					mkdir $TMP_DIR
+					for i in $pkg-*.gustpkg; do
+						[ -f $i ] || continue
+						( cd $TMP_DIR ; cpio -i receipt > /dev/null) < $i
+						[ "$(. $TMP_DIR/receipt; echo $PACKAGE)" = "$pkg" ] || continue
+						if grep -q ^$(package_fullname_in_dir $TMP_DIR).gustpkg$ $list
+						then
+							found=1
+							add $i $root --list=$list
+							break
+						fi
+					done
+					rm -rf $TMP_DIR
+				fi
+				if [ $found -eq 0 ]; then
+					if [ ! -f "$LOCALSTATE/packages.list" ]; then
+						update
+					fi
+					get_install $pkg $root
+				fi
+			fi
+		done
+	else
+		echo -e "Leaving dependencies for $PACKAGE unsolved."
+		echo -e "The package is installed but will probably not work."
+	fi
+}
+
+search_in_installed_packages()
+{
+	echo "================================================================================"
+	echo "Installed packages"
+	echo "================================================================================"
+	list=`ls -1 $INSTALLED | grep -i "$PATTERN"`
+	for pkg in $list
+	do
+		EXTRAVERSION=""
+		[ -f $INSTALLED/$pkg/receipt ] || continue
+		. $INSTALLED/$pkg/receipt
+		echo -n "$PACKAGE "
+		echo -en "\033[24G $VERSION$EXTRAVERSION"
+		echo -e "\033[42G $CATEGORY"
+		packages=$(($packages+1))
+	done
+	if [ "$packages" = "" ]; then
+		echo "0 installed packages found for : $PATTERN"
+	else
+		echo "$packages installed package(s) found for : $PATTERN"
+	fi
+}
+
+search_in_packages_list()
+{
+	echo "================================================================================"
+	echo "Available packages name-version"
+	echo "================================================================================"
+	packages=0
+	for i in $LOCALSTATE/packages.list $LOCALSTATE/undigest/*/packages.list; do
+		grep -is "$PATTERN" $i
+		packages=$(($packages + `grep -is "$PATTERN" $i | wc -l`))
+	done
+	if [ ! -f "$LOCALSTATE/packages.list" ]; then
+		echo -e "
+No 'packages.list' found to check for mirrored packages. For more results,
+please run 'gustpkg update' once as root before searching.\n"
+	fi
+	if [ "$packages" = "0" ]; then
+		echo "0 available packages found for : $PATTERN"
+	else
+		echo "$packages available package(s) found for : $PATTERN"
+	fi
+}
+
+search_in_packages_txt()
+{
+	echo "================================================================================"
+	echo "Matching packages name with version and desc"
+	echo "================================================================================"
+	packages=0
+	for i in $LOCALSTATE/packages.txt $LOCALSTATE/undigest/*/packages.txt; do
+		grep -is -A 2 "^$PATTERN" $i
+		packages=$(($packages + `grep -is "^$PATTERN" $i | wc -l`))
+	done
+	if [ ! -f "$LOCALSTATE/packages.txt" ]; then
+		echo -e "
+No 'packages.txt' found to check for mirrored packages. For more results,
+please run 'gustpkg update' once as root before searching."
+	fi
+	if [ "$packages" = "0" ]; then
+		echo "0 available packages found for : $PATTERN"
+	else
+		echo "$packages available package(s) found for : $PATTERN"
+	fi
+}
+
+dep_scan()
+{
+for i in $1; do
+	case " $ALL_DEPS " in
+	*\ $i\ *) continue;;
+	esac
+	ALL_DEPS="$ALL_DEPS $i"
+	[ -n "$2" ] && echo "$2$i"
+	[ -f $i/receipt ] || continue
+	DEPENDS=""
+	. $i/receipt
+	[ -n "$DEPENDS" ] && dep_scan "$DEPENDS" "$2  "
+done
+}
+
+rdep_scan()
+{
+for i in $1; do
+	case " $ALL_DEPS " in
+	*\ $i\ *) continue;;
+	esac
+	ALL_DEPS="$ALL_DEPS $i"
+	[ -n "$2" ] && echo "$2$i"
+	RDEPENDS=""
+	for j in *; do
+		[ -f $j/receipt ] || continue
+		DEPENDS=""
+		. $j/receipt
+		case " $(echo $DEPENDS) " in
+		*\ $i\ *)
+			RDEPENDS="$RDEPENDS $j";;
+		esac
+	done
+	[ -n "$RDEPENDS" ] && rdep_scan "$RDEPENDS" "$2  "
+done
+}
+
+list()
+{
+		#
+		if [ "$2" = "blocked" ]; then
+			echo "================================================================================"
+			echo -e "Blocked packages"
+			echo "================================================================================"
+			if [ -s "$BLOCKED" ];then
+				cat $BLOCKED
+				echo ""
+			else
+				echo -e "No blocked packages found.\n"
+			fi
+			exit 0
+		fi
+		if [ "$2" = "cat" -o "$2" = "categories" ]; then
+			echo ""
+			echo -e "\033[1mPackages categories :\033[0m"
+			for i in $CATEGORIES
+			do
+				echo $i
+				categories=$(($categories+1))
+			done
+			echo "$categories categories"
+			exit 0
+		fi
+		if [ -n "$2" ]; then
+			ASKED_CATEGORY=$2
+			echo -e "\033[1mInstalled packages of category :\033[0m $ASKED_CATEGORY"
+			for pkg in $INSTALLED/*
+			do
+				[ -f $pkg/receipt ] || continue
+				EXTRAVERSION=""
+				. $pkg/receipt
+				if [ "$CATEGORY" == "$ASKED_CATEGORY" ]; then
+					echo -n "$PACKAGE"
+					echo -e "\033[24G $VERSION$EXTRAVERSION"
+					packages=$(($packages+1))
+				fi
+			done
+			echo "================================================================================"
+			echo -e "$packages packages installed of category $ASKED_CATEGORY."
+		else
+			echo -e "\033[1mList of all installed packages\033[0m"
+			echo "================================================================================"
+			for pkg in $INSTALLED/*
+			do
+				[ -f $pkg/receipt ] || continue
+				EXTRAVERSION=""
+				. $pkg/receipt
+				echo -n "$PACKAGE"
+				echo -en "\033[24G $VERSION$EXTRAVERSION"
+				echo -e "\033[42G $CATEGORY"
+				packages=$(($packages+1))
+			done
+			echo ""
+			echo "$packages packages installed."
+		fi
+}
+
+remove()
+{
+		check_for_package_on_cmdline
+		if [ ! -f "$INSTALLED/$PACKAGE/receipt" ]; then
+			echo -e "$PACKAGE is not installed."
+			exit 0
+		else
+			ALTERED=""
+			THE_PACKAGE=$PACKAGE	# altered by receipt
+			for i in $(cd $INSTALLED ; ls); do
+				[ -f $INSTALLED/$i/receipt ] || continue
+				DEPENDS=""
+				. $INSTALLED/$i/receipt
+				case " $(echo $DEPENDS) " in
+				*\ $THE_PACKAGE\ *) ALTERED="$ALTERED $i";;
+				esac
+			done
+			EXTRAVERSION=""
+			. $INSTALLED/$THE_PACKAGE/receipt
+		fi
+		echo ""
+		if [ -n "$ALTERED" ]; then
+			echo "The following packages depend on $PACKAGE :"
+			for i in $ALTERED; do
+				echo "  $i"
+			done
+		fi
+		REFRESH=$(cd $INSTALLED ; grep -sl ^$PACKAGE$ */modifiers)
+		if [ -n "$REFRESH" ]; then
+			echo "The following packages have been modified by $PACKAGE :"
+			for i in $REFRESH; do
+				echo "  ${i%/modifiers}"
+			done
+		fi
+		echo "================================================================================"
+		echo "Remove $PACKAGE ($VERSION$EXTRAVERSION) ?"
+		echo -n "Please confirm uninstallation (Y/n) : "; read anser
+		if [ "$anser" = "y" ]; then
+			echo -e "\033[1mRemoving :\033[0m $PACKAGE"
+			if grep -q ^pre_remove $INSTALLED/$PACKAGE/receipt; then
+				pre_remove
+			fi
+			echo -n "Removing all files installed..."
+			if [ -f $INSTALLED/$PACKAGE/modifiers ]; then
+			    for mod in `cat $INSTALLED/$PACKAGE/modifiers`
+			    do
+				for file in `cat $INSTALLED/$PACKAGE/files.list`
+				do
+					[ $(grep ^$file$ $INSTALLED/$mod/files.list | wc -l) -gt 1 ] && continue
+					rm -f $file 2>/dev/null
+					dir="$file"
+					while [ "$dir" != "/" ]; do
+						dir="$(dirname $dir)"
+						rmdir $dir 2> /dev/null || break
+					done
+				done
+			    done
+			else
+				for file in `cat $INSTALLED/$PACKAGE/files.list`
+				do
+					rm -f $file 2>/dev/null
+					dir="$file"
+					while [ "$dir" != "/" ]; do
+						dir="$(dirname $dir)"
+						rmdir $dir 2> /dev/null || break
+					done
+				done
+			fi
+			status
+			if grep -q ^post_remove $INSTALLED/$PACKAGE/receipt; then
+				post_remove
+			fi
+			echo -n "Removing package receipt..."
+			rm -rf $INSTALLED/$PACKAGE
+			status
+			sed -i "/ $PACKAGE-$VERSION$EXTRAVERSION$/d" \
+				$LOCALSTATE/installed.md5 2> /dev/null
+			log Removed
+			if [ -n "$ALTERED" ]; then
+				echo -n "Remove packages depending on $PACKAGE"
+				echo -n " (Y/n) ? "; read anser
+				if [ "$anser" = "y" ]; then
+					for i in $ALTERED; do
+						if [ -d "$INSTALLED/$i" ]; then
+							remove $i
+						fi
+					done
+				fi
+			fi
+			if [ -n "$REFRESH" ]; then
+				echo -n "Reinstall packages modified by $PACKAGE"
+				echo -n " (Y/n) ? "; read anser
+				if [ "$anser" = "y" ]; then
+					for i in $REFRESH; do
+						if [ $(wc -l < $INSTALLED/$i) -gt 1 ]; then
+							echo "Check $INSTALLED/$i for reinstallation"
+							continue
+						fi
+						rm -r $INSTALLED/$i
+						get_install ${i%/modifiers} --forced
+					done
+				fi
+			fi
+		else
+			echo "Uninstallation of $PACKAGE cancelled."
+		fi
+}
+
+upgrade()
+{
+		cd $LOCALSTATE
+		touch blocked-packages.list
+		rm -f upgradeable-packages.list
+		echo "================================================================================"
+		echo -e "\033[1mAvailable upgrades\033[0m"
+		echo "================================================================================"
+		FIRST_CLASS_PACKAGE=""
+		for pkg in $INSTALLED/*
+		do 
+			[ -f $pkg/receipt ] || continue
+			EXTRAVERSION=""
+			. $pkg/receipt
+			echo -en "\\033[0G                                         "
+			echo -en "\\033[0G$PACKAGE"
+			if grep -qs "^$PACKAGE" $BLOCKED; then
+				blocked=$(($blocked+1))
+			else
+				NEW_PACKAGE=$(get_package_filename $PACKAGE)
+
+				if [ -n "$NEW_PACKAGE" ]; then
+					NEW_VERSION=`echo $NEW_PACKAGE | sed s/$PACKAGE-/''/`
+					NEW_VERSION=`echo $NEW_VERSION | sed s/'-'/'.'/`
+					VERSION=`echo $VERSION | sed s/'-'/'.'/`$EXTRAVERSION
+					NEW_VERSION=`echo $NEW_VERSION | sed s/'pre'/'.'/`
+					VERSION=`echo $VERSION | sed s/'pre'/'.'/`
+					NEW_VERSION=`echo $NEW_VERSION | sed 's/[A-Z]\.//'`
+					VERSION=`echo $VERSION | sed 's/[A-Z]\.//'`
+					RELEASE=""
+					if [ -f installed.md5 -a -f packages.md5 ]; then
+						current_md5=$(grep -s "  $PACKAGE-$VERSION" installed.md5 | awk '{ print $1 }')
+						new_md5=$(grep -hs "  $PACKAGE-$VERSION" packages.md5 undigest/*/packages.md5 | head -1 | awk '{ print $1 }')
+						[ -n "$current_md5" ] && [ -n "$new_md5" ] &&
+						[ "$current_md5" != "$new_md5" ] && RELEASE=build
+					fi
+					if [ "$VERSION" != "$NEW_VERSION" -o -n "$RELEASE" ]; then
+						PKG_MAJOR=`echo ${VERSION%_*} | cut -f1 -d"."`
+						NEW_MAJOR=`echo ${NEW_VERSION%_*} | cut -f1 -d"."`
+						PKG_MINOR=`echo ${VERSION%_*} | cut -f2 -d"."`
+						NEW_MINOR=`echo ${NEW_VERSION%_*} | cut -f2 -d"."`
+						if [ "$NEW_MINOR" -gt "$PKG_MINOR" ] 2> /dev/null; then
+							RELEASE=minor
+						fi
+						if [ "$NEW_MINOR" -lt "$PKG_MINOR" ] 2> /dev/null; then
+							RELEASE=$WARNING
+							FIXE=yes
+						fi
+						if [ "$NEW_MAJOR" -gt "$PKG_MAJOR" ] 2> /dev/null; then
+							RELEASE=major
+							FIXE=""
+						fi
+						if [ "$NEW_MAJOR" -lt "$PKG_MAJOR" ] 2> /dev/null; then
+							RELEASE=$WARNING
+							FIXE=yes
+						fi
+						if [ -z $RELEASE ]; then
+							RELEASE=revision
+						fi
+						echo -en "\033[24G $VERSION"
+						echo -en "\033[38G --->"
+						echo -en "\033[43G $NEW_VERSION"
+						echo -en "\033[58G $CATEGORY"
+						echo -e "\033[72G $RELEASE"
+						up=$(($up+1))
+						echo "$PACKAGE" >> upgradeable-packages.list
+						case "$FIRST_CLASS_PACKAGE" in
+						*\ $PACKAGE\ *) echo "$PACKAGE" >> upgradeable-packages.list$$;;
+						esac
+						unset RELEASE
+					fi
+					packages=$(($packages+1))
+				fi
+			fi
+		done
+		if [ -z $blocked ]; then
+			blocked=0
+		fi
+		if [ ! "$up" = "" ]; then
+			echo -e "\\033[0G                                         "
+			echo "================================================================================"
+			echo "$packages installed and listed packages to consider, $up to upgrade, $blocked blocked."
+		else
+			echo -e "\\033[0GSystem is up-to-date.                    "
+			echo "$packages installed and listed packages to consider, 0 to upgrade, $blocked blocked."
+			echo "================================================================================"
+			exit 0
+		fi
+		if [ "$FIXE" == "yes" ]; then
+			echo -e "$WARNING ---> Installed package seems more recent than the mirrored one."
+			echo "You can block packages using the command : 'gustpkg block package'"
+			echo "Or upgrade packages at your own risk."
+			echo ""
+		fi
+		echo -n "Upgrade now (Y/n) ? "; read anser
+		if [ ! "$anser" = "y" ]; then
+			echo -e "\nExiting. No package upgraded.\n"
+			exit 0
+		fi
+		cat upgradeable-packages.list >> upgradeable-packages.list$$
+		mv -f upgradeable-packages.list$$ upgradeable-packages.list
+		yes y | get_list upgradeable-packages.list --forced
+		rm -f upgradeable-packages.list
+}
+
+block()
+{
+		# Add a pkg name to the list of blocked packages.
+		#
+		check_root
+		check_for_package_on_cmdline
+		echo ""
+		if grep -qs "^$PACKAGE" $BLOCKED; then
+			echo "$PACKAGE is already in the blocked packages list."
+			echo ""
+			exit 0
+		else
+			echo -n "Add $PACKAGE to : $BLOCKED..."
+			echo $PACKAGE >> $BLOCKED
+			status
+			# Log this activity
+			. $INSTALLED/$PACKAGE/receipt
+			log Blocked
+		fi
+		echo ""
+}
+
+unblock()
+{
+		echo ""
+		if grep -qs "^$PACKAGE" $BLOCKED; then
+			echo -n "Removing $PACKAGE from : $BLOCKED..."
+			sed -i s/$PACKAGE/''/ $BLOCKED
+			sed -i '/^$/d' $BLOCKED
+			status
+			. $INSTALLED/$PACKAGE/receipt
+			log Unblocked
+		else
+			echo "$PACKAGE is not in the blocked packages list."
+			echo ""
+			exit 0
+		fi
+		echo ""
+}
+
+get()
+{
+		download $PACKAGE.gustpkg
+}
+
+update()
+{
+		for path in $LOCALSTATE $LOCALSTATE/undigest/*; do
+			[ -f $path/mirror ] || continue
+			echo ""
+			if [ "$path" != "$LOCALSTATE" ]; then
+				echo "Recharge undigest $(basename $path):"
+			fi
+			cd $path
+			if [ -f "packages.list" ]; then
+				echo -n "Creating backup of the last packages list..."
+				mv -f packages.desc packages.desc.bak 2>/dev/null
+				mv -f packages.md5 packages.md5.txt 2>/dev/null
+				mv -f packages.txt packages.txt.bak 2>/dev/null
+				mv -f packages.list packages.list.bak 2>/dev/null
+				mv -f packages.equiv packages.equiv.bak 2>/dev/null
+				mv -f files.list.lzma files.list.lzma.bak 2> /dev/null
+				mv -f mirrors mirrors.bak 2> /dev/null
+				status
+			fi
+			download_from "$(cat mirror)" packages.desc
+			download_from "$(cat mirror)" packages.md5
+			download_from "$(cat mirror)" packages.txt
+			download_from "$(cat mirror)" packages.list
+			download_from "$(cat mirror)" packages.equiv
+			download_from "$(cat mirror)" files.list.lzma
+			download_from "$(cat mirror)" mirrors
+			[ -f mirrors ] || mv mirrors.bak mirrors 2> /dev/null
+			suffix=$(head -1 mirror)
+			suffix=packages${suffix#*/packages}
+			for i in $(cat mirrors 2> /dev/null); do
+				grep -qs $i mirror || echo $i$suffix >> mirror
+			done
+			if [ -f "packages.list.bak" ]; then
+				diff -u packages.list.bak packages.list | grep ^+[a-z] > packages.diff
+				sed -i s/+// packages.diff
+				echo "================================================================================"
+				echo -e "\033[1mMirrored packages diff\033[0m"
+				echo "================================================================================"
+				cat packages.diff
+				if [ ! "`cat packages.diff | wc -l`" = 0 ]; then
+					echo "`cat packages.diff | wc -l` new packages on the mirror."
+				else
+					echo "`cat packages.diff | wc -l` new packages on the mirror."
+				fi
+			else
+				echo -e "
+================================================================================
+Last packages.list is ready to use. Note that next time you recharge the list,
+a list of differencies will be displayed to show new and upgradeable packages.
+================================================================================"
+			fi
+		done
+}
+
+get_list()
+{
+		if [ -z "$2" ]; then
+			echo -e "
+Please change directory (cd) to the packages repository, and specify the
+list of packages to install. Example : gustpkg get-list packages.list"
+			exit 0
+		fi
+		if [ ! -f "$2" ]; then
+			echo "Unable to find : $2"
+			exit 0
+		else
+			LIST=`cat $2`
+		fi
+		
+		export INSTALL_LIST="$2"
+
+		if [ "$1" = "get-install-list" ]; then
+			COMMAND=get-list
+		else
+			COMMAND=install
+		fi
+		touch $2-processed
+		for pkg in $LIST
+		do
+			grep -qs ^$pkg$ $2-processed && continue
+			gustpkg $COMMAND $pkg --list=$2 "$3" "$4" "$5"
+		done
+		rm -f $2-processed
+}
+
+add()
+{
+		DO_CHECK="yes"
+		ROOT=""
+		while [ -n "$3" ]; do
+			case "$3" in
+			--forced)
+				DO_CHECK="no"
+				;;
+			--root=*)
+				ROOT="${3#--root=}"
+				;;
+			--list=*)
+				INSTALL_LIST="${3#--list=}"
+				;;
+			*)	shift 2
+				echo -e "Unknown option $*."
+				exit 1
+				;;
+			usage)
+			esac
+			shift
+		done
+		if [ "$DO_CHECK" = "yes" ]; then
+			check_for_installed_package $ROOT
+		fi
+		install_package $ROOT
+}
+
+get_install()
+{
+		DO_CHECK=""
+		while [ -n "$3" ]; do
+			case "$3" in
+			--forced)
+				DO_CHECK="no"
+				;;
+			--root=*)
+				ROOT="${3#--root=}"
+				;;
+			--list=*)
+				INSTALL_LIST="${3#--list=}"
+				;;
+			*)	shift 2
+				echo -e "\nUnknown option $*.\n"
+				exit 1
+				;;
+			esac
+			shift
+		done
+		AUTOEXEC="no"
+		if ! check_for_package_in_list check; then
+			PACKAGE=get-$PACKAGE
+			AUTOEXEC=$PACKAGE
+			check_for_package_in_list
+			if [ -n "$(get_installed_package_pathname $PACKAGE $ROOT)" ]; then
+				$AUTOEXEC $ROOT
+				exit 0
+			fi
+		fi
+		if [ "$DO_CHECK" = "no" ]; then
+			rm -f $CACHE_DIR/$PACKAGE.gustpkg
+		else
+			check_for_installed_package $ROOT
+		fi
+		cd $CACHE_DIR
+		if [ -f "$PACKAGE.gustpkg" ]; then
+			echo "$PACKAGE already in the cache : $CACHE_DIR"
+			tail -c 2k $PACKAGE.gustpkg | grep -q 00000000TRAILER || {
+				echo "Continue $PACKAGE download"
+				download $PACKAGE.gustpkg
+			}
+		else
+			echo ""
+			download $PACKAGE.gustpkg
+		fi
+		PACKAGE_FILE=$CACHE_DIR/$PACKAGE.gustpkg
+		install_package $ROOT
+		[ "$AUTOEXEC" != "no" ] && $PACKAGE $ROOT
+}
+
+equivalent_pkg()
+{
+	for i in $(grep -hs "^$1=" $LOCALSTATE/packages.equiv \
+		   $LOCALSTATE/undigest/*/packages.equiv | sed "s/^$1=//"); do
+		if echo $i | grep -q : ; then
+			if [ -f $2$INSTALLED/${i%:*}/receipt ]; then
+				echo ${i#*:}
+				return
+			fi
+		else
+			if [ -f $2$INSTALLED/$i/receipt ]; then
+				echo $i
+				return
+			fi
+		fi
+	done
+	echo $1
+}
+
+# === Main =====================================================================
+
+case "$COMMAND" in
+	add)
+		check_root
+		check_for_package_on_cmdline
+		check_for_package_file
+		add
+	;;
+	block)
+		check_root
+		check_for_package_on_cmdline
+		block
+	;;
+	download-only)
+		check_for_package_on_cmdline
+		check_for_packages_list
+		check_for_package_in_list
+		get
+	;;
+	get-list)
+		check_root
+		get_list
+	;;
+	install)
+		check_root
+		check_for_package_on_cmdline
+		check_for_packages_list
+		get_install
+	;;
+	list)
+		list
+	;;
+	remove)
+		check_root
+		check_for_package_on_cmdline
+		remove
+	;;
+	unblock)
+		check_root
+		check_for_package_on_cmdline
+		unblock
+	;;
+	upgrade)
+		check_root
+		check_for_packages_list
+		upgrade
+	;;
+	update)
+		check_root
+		update
+	;;
+	usage|*)
+		usage
+	;;
+
+esac
+
+exit 0
